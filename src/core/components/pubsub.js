@@ -7,60 +7,18 @@ const _values = require('lodash.values')
 const OFFLINE_ERROR = require('../utils').OFFLINE_ERROR
 
 module.exports = function pubsub (self) {
-  let subscriptions = {}
-
-  const addSubscription = (topic, request, stream) => {
-    subscriptions[topic] = { request: request, stream: stream }
-  }
-
-  const removeSubscription = promisify((topic, callback) => {
-    if (!subscriptions[topic]) {
-      return callback(new Error(`Not subscribed to ${topic}`))
-    }
-
-    subscriptions[topic].stream.emit('end')
-    delete subscriptions[topic]
-
-    if (callback) {
-      callback(null)
-    }
-  })
-
   return {
     subscribe: promisify((topic, options, callback) => {
-      if (!self.isOnline()) {
-        throw OFFLINE_ERROR
-      }
+      if (!self.isOnline()) { throw OFFLINE_ERROR }
 
       if (typeof options === 'function') {
         callback = options
         options = {}
       }
 
-      if (subscriptions[topic]) {
+      if (self._pubsub.getSubscriptions().indexOf(topic) > -1) {
         return callback(`Error: Already subscribed to '${topic}'`)
       }
-
-      const stream = new Readable({ objectMode: true })
-
-      stream._read = () => {}
-
-      // There is no explicit unsubscribe; subscriptions have a cancel event
-      stream.cancel = promisify((cb) => {
-        // Remove the event listener
-        self._pubsub.removeAllListeners(topic)
-        // Make sure floodsub knows we've unsubscribed
-        self._pubsub.unsubscribe(topic)
-        // Remove the subscription from pubsub's internal state
-        removeSubscription(topic, cb)
-      })
-
-      self._pubsub.on(topic, (data) => {
-        stream.emit('data', {
-          data: data.toString(),
-          topicIDs: [topic]
-        })
-      })
 
       try {
         self._pubsub.subscribe(topic)
@@ -68,9 +26,34 @@ module.exports = function pubsub (self) {
         return callback(err)
       }
 
+      const subscription = new Readable({ objectMode: true })
+      let canceled = false
+      subscription._read = () => {}
+
+      // Attach an extra `cancel` method to the stream
+      subscription.cancel = promisify((cb) => {
+        canceled = true
+        self._pubsub.unsubscribe(topic)
+        self._pubsub.removeListener(topic, handler)
+        subscription.on('end', cb)
+        subscription.resume() // make sure it is flowing before cancel
+        subscription.push(null)
+      })
+
+      self._pubsub.on(topic, handler)
+
+      function handler (data) {
+        if (canceled) {
+          return
+        }
+        subscription.push({
+          data: data,
+          topicIDs: [topic]
+        })
+      }
+
       // Add the request to the active subscriptions and return the stream
-      addSubscription(topic, null, stream)
-      callback(null, stream)
+      setImmediate(() => callback(null, subscription))
     }),
 
     publish: promisify((topic, data, callback) => {
@@ -78,15 +61,16 @@ module.exports = function pubsub (self) {
         throw OFFLINE_ERROR
       }
 
-      const buf = Buffer.isBuffer(data) ? data : new Buffer(data)
+      // TODO: Tests don't show that we actually expect this, @haad??
+      // data = Buffer.isBuffer(data) ? data : new Buffer(data)
 
       try {
-        self._pubsub.publish(topic, buf)
+        self._pubsub.publish(topic, data)
       } catch (err) {
         return callback(err)
       }
 
-      callback(null)
+      setImmediate(() => callback())
     }),
 
     ls: promisify((callback) => {
@@ -102,7 +86,7 @@ module.exports = function pubsub (self) {
         return callback(err)
       }
 
-      callback(null, subscriptions)
+      setImmediate(() => callback(null, subscriptions))
     }),
 
     peers: promisify((topic, callback) => {
@@ -110,7 +94,7 @@ module.exports = function pubsub (self) {
         throw OFFLINE_ERROR
       }
 
-      if (!subscriptions[topic]) {
+      if (self._pubsub.getSubscriptions().indexOf(topic) < 0) {
         return callback(`Error: Not subscribed to '${topic}'`)
       }
 
@@ -131,7 +115,7 @@ module.exports = function pubsub (self) {
         return callback(err)
       }
 
-      callback(null, peers)
+      setImmediate(() => callback(null, peers))
     })
   }
 }
